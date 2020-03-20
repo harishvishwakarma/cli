@@ -1,6 +1,7 @@
 package command
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"time"
@@ -13,6 +14,39 @@ import (
 	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
+
+type defaults struct {
+	Title string
+	Body  string
+}
+
+func computeDefaults(baseRef, headRef string) (defaults, error) {
+	commits, err := git.Commits(baseRef, headRef)
+	if err != nil {
+		return defaults{}, err
+	}
+
+	out := defaults{}
+
+	if len(commits) == 1 {
+		out.Title = commits[0].Title
+		body, err := git.CommitBody(commits[0].Sha)
+		if err != nil {
+			return defaults{}, err
+		}
+		out.Body = body
+	} else {
+		out.Title = utils.Humanize(headRef)
+
+		body := ""
+		for _, c := range commits {
+			body += fmt.Sprintf("- %s\n", c.Title)
+		}
+		out.Body = body
+	}
+
+	return out, nil
+}
 
 func prCreate(cmd *cobra.Command, _ []string) error {
 	ctx := contextForCommand(cmd)
@@ -41,6 +75,7 @@ func prCreate(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("could not determine the current branch: %w", err)
 	}
+	headRepo, headRepoErr := repoContext.HeadRepo()
 
 	baseBranch, err := cmd.Flags().GetString("base")
 	if err != nil {
@@ -49,13 +84,119 @@ func prCreate(cmd *cobra.Command, _ []string) error {
 	if baseBranch == "" {
 		baseBranch = baseRepo.DefaultBranchRef.Name
 	}
+	if headBranch == baseBranch && headRepo != nil && ghrepo.IsSame(baseRepo, headRepo) {
+		return fmt.Errorf("must be on a branch named differently than %q", baseBranch)
+	}
+
+	if ucc, err := git.UncommittedChangeCount(); err == nil && ucc > 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s\n", utils.Pluralize(ucc, "uncommitted change"))
+	}
+
+	title, err := cmd.Flags().GetString("title")
+	if err != nil {
+		return fmt.Errorf("could not parse title: %w", err)
+	}
+	body, err := cmd.Flags().GetString("body")
+	if err != nil {
+		return fmt.Errorf("could not parse body: %w", err)
+	}
+
+	defs, defaultsErr := computeDefaults(baseBranch, headBranch)
+
+	isWeb, err := cmd.Flags().GetBool("web")
+	if err != nil {
+		return fmt.Errorf("could not parse web: %q", err)
+	}
+
+	autofill, err := cmd.Flags().GetBool("fill")
+	if err != nil {
+		return fmt.Errorf("could not parse fill: %q", err)
+	}
+
+	action := SubmitAction
+	if isWeb {
+		action = PreviewAction
+		if (title == "" || body == "") && defaultsErr != nil {
+			return fmt.Errorf("could not compute title or body defaults: %w", defaultsErr)
+		}
+	} else if autofill {
+		if defaultsErr != nil {
+			return fmt.Errorf("could not compute title or body defaults: %w", defaultsErr)
+		}
+		title = defs.Title
+		body = defs.Body
+	}
+
+	if !isWeb {
+		headBranchLabel := headBranch
+		if headRepo != nil && !ghrepo.IsSame(baseRepo, headRepo) {
+			headBranchLabel = fmt.Sprintf("%s:%s", headRepo.RepoOwner(), headBranch)
+		}
+		existingPR, err := api.PullRequestForBranch(client, baseRepo, headBranchLabel)
+		var notFound *api.NotFoundError
+		if err != nil && !errors.As(err, &notFound) {
+			return fmt.Errorf("error checking for existing pull request: %w", err)
+		}
+		if err == nil {
+			return fmt.Errorf("a pull request for branch %q already exists:\n%s", headBranchLabel, existingPR.URL)
+		}
+	}
+
+	if !isWeb && !autofill {
+		fmt.Fprintf(colorableErr(cmd), "\nCreating pull request for %s into %s in %s\n\n",
+			utils.Cyan(headBranch),
+			utils.Cyan(baseBranch),
+			ghrepo.FullName(baseRepo))
+		if (title == "" || body == "") && defaultsErr != nil {
+			fmt.Fprintf(colorableErr(cmd), "%s warning: could not compute title or body defaults: %s\n", utils.Yellow("!"), defaultsErr)
+		}
+	}
+
+	// TODO: only drop into interactive mode if stdin & stdout are a tty
+	if !isWeb && !autofill && (title == "" || body == "") {
+		var templateFiles []string
+		if rootDir, err := git.ToplevelDir(); err == nil {
+			// TODO: figure out how to stub this in tests
+			templateFiles = githubtemplate.Find(rootDir, "PULL_REQUEST_TEMPLATE")
+		}
+
+		tb, err := titleBodySurvey(cmd, title, body, defs, templateFiles)
+		if err != nil {
+			return fmt.Errorf("could not collect title and/or body: %w", err)
+		}
+
+		action = tb.Action
+
+		if action == CancelAction {
+			fmt.Fprintln(cmd.ErrOrStderr(), "Discarding.")
+			return nil
+		}
+
+		if title == "" {
+			title = tb.Title
+		}
+		if body == "" {
+			body = tb.Body
+		}
+	}
+
+	if action == SubmitAction && title == "" {
+		return errors.New("pull request title must not be blank")
+	}
+
+	isDraft, err := cmd.Flags().GetBool("draft")
+	if err != nil {
+		return fmt.Errorf("could not parse draft: %w", err)
+	}
+	if isDraft && isWeb {
+		return errors.New("the --draft flag is not supported with --web")
+	}
 
 	didForkRepo := false
 	var headRemote *context.Remote
-	headRepo, err := repoContext.HeadRepo()
-	if err != nil {
+	if headRepoErr != nil {
 		if baseRepo.IsPrivate {
-			return fmt.Errorf("cannot write to private repository '%s'", ghrepo.FullName(baseRepo))
+			return fmt.Errorf("cannot fork private repository '%s'", ghrepo.FullName(baseRepo))
 		}
 		headRepo, err = api.ForkRepo(client, baseRepo)
 		if err != nil {
@@ -77,8 +218,9 @@ func prCreate(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	if headBranch == baseBranch && ghrepo.IsSame(baseRepo, headRepo) {
-		return fmt.Errorf("must be on a branch named differently than %q", baseBranch)
+	headBranchLabel := headBranch
+	if !ghrepo.IsSame(baseRepo, headRepo) {
+		headBranchLabel = fmt.Sprintf("%s:%s", headRepo.RepoOwner(), headBranch)
 	}
 
 	if headRemote == nil {
@@ -88,9 +230,6 @@ func prCreate(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	if ucc, err := git.UncommittedChangeCount(); err == nil && ucc > 0 {
-		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s\n", utils.Pluralize(ucc, "uncommitted change"))
-	}
 	pushTries := 0
 	maxPushTries := 3
 	for {
@@ -109,87 +248,13 @@ func prCreate(cmd *cobra.Command, _ []string) error {
 		break
 	}
 
-	headBranchLabel := headBranch
-	if !ghrepo.IsSame(baseRepo, headRepo) {
-		headBranchLabel = fmt.Sprintf("%s:%s", headRepo.RepoOwner(), headBranch)
-	}
-
-	title, err := cmd.Flags().GetString("title")
-	if err != nil {
-		return fmt.Errorf("could not parse title: %w", err)
-	}
-	body, err := cmd.Flags().GetString("body")
-	if err != nil {
-		return fmt.Errorf("could not parse body: %w", err)
-	}
-
-	isWeb, err := cmd.Flags().GetBool("web")
-	if err != nil {
-		return fmt.Errorf("could not parse web: %q", err)
-	}
-	if isWeb {
-		compareURL := generateCompareURL(baseRepo, baseBranch, headBranchLabel, title, body)
-		fmt.Fprintf(cmd.ErrOrStderr(), "Opening %s in your browser.\n", displayURL(compareURL))
-		return utils.OpenInBrowser(compareURL)
-	}
-
-	fmt.Fprintf(colorableErr(cmd), "\nCreating pull request for %s into %s in %s\n\n",
-		utils.Cyan(headBranchLabel),
-		utils.Cyan(baseBranch),
-		ghrepo.FullName(baseRepo))
-
-	action := SubmitAction
-
-	interactive := title == "" || body == ""
-
-	if interactive {
-		var templateFiles []string
-		if rootDir, err := git.ToplevelDir(); err == nil {
-			// TODO: figure out how to stub this in tests
-			templateFiles = githubtemplate.Find(rootDir, "PULL_REQUEST_TEMPLATE")
-		}
-
-		tb, err := titleBodySurvey(cmd, title, body, templateFiles)
-		if err != nil {
-			return fmt.Errorf("could not collect title and/or body: %w", err)
-		}
-
-		action = tb.Action
-
-		if action == CancelAction {
-			fmt.Fprintln(cmd.ErrOrStderr(), "Discarding.")
-			return nil
-		}
-
-		if title == "" {
-			title = tb.Title
-		}
-		if body == "" {
-			body = tb.Body
-		}
-	}
-
-	isDraft, err := cmd.Flags().GetBool("draft")
-	if err != nil {
-		return fmt.Errorf("could not parse draft: %w", err)
-	}
-
 	if action == SubmitAction {
-		if title == "" {
-			return fmt.Errorf("pull request title must not be blank")
-		}
-
-		headRefName := headBranch
-		if !ghrepo.IsSame(headRemote, baseRepo) {
-			headRefName = fmt.Sprintf("%s:%s", headRemote.RepoOwner(), headBranch)
-		}
-
 		params := map[string]interface{}{
 			"title":       title,
 			"body":        body,
 			"draft":       isDraft,
 			"baseRefName": baseBranch,
-			"headRefName": headRefName,
+			"headRefName": headBranchLabel,
 		}
 
 		pr, err := api.CreatePullRequest(client, baseRepo, params)
@@ -208,7 +273,6 @@ func prCreate(cmd *cobra.Command, _ []string) error {
 	}
 
 	return nil
-
 }
 
 func generateCompareURL(r ghrepo.Interface, base, head, title, body string) string {
@@ -243,4 +307,5 @@ func init() {
 	prCreateCmd.Flags().StringP("base", "B", "",
 		"The branch into which you want your code merged")
 	prCreateCmd.Flags().BoolP("web", "w", false, "Open the web browser to create a pull request")
+	prCreateCmd.Flags().BoolP("fill", "f", false, "Do not prompt for title/body and just use commit info")
 }

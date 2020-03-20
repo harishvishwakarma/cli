@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cli/cli/test"
 	"github.com/cli/cli/utils"
 	"github.com/google/shlex"
 	"github.com/spf13/cobra"
@@ -57,7 +58,7 @@ func RunCommand(cmd *cobra.Command, args string) (*cmdOut, error) {
 			v.Replace([]string{})
 		default:
 			switch v.Type() {
-			case "bool", "string":
+			case "bool", "string", "int":
 				v.Set(f.DefValue)
 			}
 		}
@@ -110,7 +111,7 @@ func TestPRStatus_fork(t *testing.T) {
 	defer utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
 		switch strings.Join(cmd.Args, " ") {
 		case `git config --get-regexp ^branch\.blueberries\.(remote|merge)$`:
-			return &outputStub{[]byte(`branch.blueberries.remote origin
+			return &test.OutputStub{[]byte(`branch.blueberries.remote origin
 branch.blueberries.merge refs/heads/blueberries`)}
 		default:
 			panic("not implemented")
@@ -152,6 +153,80 @@ func TestPRStatus_reviewsAndChecks(t *testing.T) {
 		if !strings.Contains(output.String(), line) {
 			t.Errorf("output did not contain %q: %q", line, output.String())
 		}
+	}
+}
+
+func TestPRStatus_currentBranch_showTheMostRecentPR(t *testing.T) {
+	initBlankContext("OWNER/REPO", "blueberries")
+	http := initFakeHTTP()
+	http.StubRepoResponse("OWNER", "REPO")
+
+	jsonFile, _ := os.Open("../test/fixtures/prStatusCurrentBranch.json")
+	defer jsonFile.Close()
+	http.StubResponse(200, jsonFile)
+
+	output, err := RunCommand(prStatusCmd, "pr status")
+	if err != nil {
+		t.Errorf("error running command `pr status`: %v", err)
+	}
+
+	expectedLine := regexp.MustCompile(`#10  Blueberries are certainly a good fruit \[blueberries\]`)
+	if !expectedLine.MatchString(output.String()) {
+		t.Errorf("output did not match regexp /%s/\n> output\n%s\n", expectedLine, output)
+		return
+	}
+
+	unexpectedLines := []*regexp.Regexp{
+		regexp.MustCompile(`#9  Blueberries are a good fruit \[blueberries\] - Merged`),
+		regexp.MustCompile(`#8  Blueberries are probably a good fruit \[blueberries\] - Closed`),
+	}
+	for _, r := range unexpectedLines {
+		if r.MatchString(output.String()) {
+			t.Errorf("output unexpectedly match regexp /%s/\n> output\n%s\n", r, output)
+			return
+		}
+	}
+}
+
+func TestPRStatus_currentBranch_Closed(t *testing.T) {
+	initBlankContext("OWNER/REPO", "blueberries")
+	http := initFakeHTTP()
+	http.StubRepoResponse("OWNER", "REPO")
+
+	jsonFile, _ := os.Open("../test/fixtures/prStatusCurrentBranchClosed.json")
+	defer jsonFile.Close()
+	http.StubResponse(200, jsonFile)
+
+	output, err := RunCommand(prStatusCmd, "pr status")
+	if err != nil {
+		t.Errorf("error running command `pr status`: %v", err)
+	}
+
+	expectedLine := regexp.MustCompile(`#8  Blueberries are a good fruit \[blueberries\] - Closed`)
+	if !expectedLine.MatchString(output.String()) {
+		t.Errorf("output did not match regexp /%s/\n> output\n%s\n", expectedLine, output)
+		return
+	}
+}
+
+func TestPRStatus_currentBranch_Merged(t *testing.T) {
+	initBlankContext("OWNER/REPO", "blueberries")
+	http := initFakeHTTP()
+	http.StubRepoResponse("OWNER", "REPO")
+
+	jsonFile, _ := os.Open("../test/fixtures/prStatusCurrentBranchMerged.json")
+	defer jsonFile.Close()
+	http.StubResponse(200, jsonFile)
+
+	output, err := RunCommand(prStatusCmd, "pr status")
+	if err != nil {
+		t.Errorf("error running command `pr status`: %v", err)
+	}
+
+	expectedLine := regexp.MustCompile(`#8  Blueberries are a good fruit \[blueberries\] - Merged`)
+	if !expectedLine.MatchString(output.String()) {
+		t.Errorf("output did not match regexp /%s/\n> output\n%s\n", expectedLine, output)
+		return
 	}
 }
 
@@ -201,6 +276,10 @@ func TestPRList(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	eq(t, output.Stderr(), `
+Showing 3 of 3 pull requests in OWNER/REPO
+
+`)
 	eq(t, output.String(), `32	New feature	feature
 29	Fixed bad bug	hubot:bug-fix
 28	Improve documentation	docs
@@ -222,9 +301,8 @@ func TestPRList_filtering(t *testing.T) {
 
 	eq(t, output.String(), "")
 	eq(t, output.Stderr(), `
-Pull requests for OWNER/REPO
+No pull requests match your search in OWNER/REPO
 
-No pull requests match your search
 `)
 
 	bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
@@ -362,7 +440,7 @@ func TestPRView_previewCurrentBranch(t *testing.T) {
 	http.StubResponse(200, jsonFile)
 
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
-		return &outputStub{}
+		return &test.OutputStub{}
 	})
 	defer restoreCmd()
 
@@ -397,7 +475,7 @@ func TestPRView_previewCurrentBranchWithEmptyBody(t *testing.T) {
 	http.StubResponse(200, jsonFile)
 
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
-		return &outputStub{}
+		return &test.OutputStub{}
 	})
 	defer restoreCmd()
 
@@ -434,10 +512,10 @@ func TestPRView_currentBranch(t *testing.T) {
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
 		switch strings.Join(cmd.Args, " ") {
 		case `git config --get-regexp ^branch\.blueberries\.(remote|merge)$`:
-			return &outputStub{}
+			return &test.OutputStub{}
 		default:
 			seenCmd = cmd
-			return &outputStub{}
+			return &test.OutputStub{}
 		}
 	})
 	defer restoreCmd()
@@ -472,10 +550,10 @@ func TestPRView_noResultsForBranch(t *testing.T) {
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
 		switch strings.Join(cmd.Args, " ") {
 		case `git config --get-regexp ^branch\.blueberries\.(remote|merge)$`:
-			return &outputStub{}
+			return &test.OutputStub{}
 		default:
 			seenCmd = cmd
-			return &outputStub{}
+			return &test.OutputStub{}
 		}
 	})
 	defer restoreCmd()
@@ -504,7 +582,7 @@ func TestPRView_numberArg(t *testing.T) {
 	var seenCmd *exec.Cmd
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
 		seenCmd = cmd
-		return &outputStub{}
+		return &test.OutputStub{}
 	})
 	defer restoreCmd()
 
@@ -536,7 +614,7 @@ func TestPRView_numberArgWithHash(t *testing.T) {
 	var seenCmd *exec.Cmd
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
 		seenCmd = cmd
-		return &outputStub{}
+		return &test.OutputStub{}
 	})
 	defer restoreCmd()
 
@@ -568,7 +646,7 @@ func TestPRView_urlArg(t *testing.T) {
 	var seenCmd *exec.Cmd
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
 		seenCmd = cmd
-		return &outputStub{}
+		return &test.OutputStub{}
 	})
 	defer restoreCmd()
 
@@ -602,7 +680,7 @@ func TestPRView_branchArg(t *testing.T) {
 	var seenCmd *exec.Cmd
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
 		seenCmd = cmd
-		return &outputStub{}
+		return &test.OutputStub{}
 	})
 	defer restoreCmd()
 
@@ -637,7 +715,7 @@ func TestPRView_branchWithOwnerArg(t *testing.T) {
 	var seenCmd *exec.Cmd
 	restoreCmd := utils.SetPrepareCmd(func(cmd *exec.Cmd) utils.Runnable {
 		seenCmd = cmd
-		return &outputStub{}
+		return &test.OutputStub{}
 	})
 	defer restoreCmd()
 

@@ -81,8 +81,9 @@ func prStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	repoOverride, _ := cmd.Flags().GetString("repo")
 	currentPRNumber, currentPRHeadRef, err := prSelectorForCurrentBranch(ctx, baseRepo)
-	if err != nil {
+	if err != nil && repoOverride == "" && err.Error() != "git: not on any branch" {
 		return err
 	}
 
@@ -98,8 +99,10 @@ func prStatus(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(out, "")
 
 	printHeader(out, "Current branch")
-	if prPayload.CurrentPRs != nil {
-		printPrs(out, 0, prPayload.CurrentPRs...)
+	if prPayload.CurrentPR != nil {
+		printPrs(out, 0, *prPayload.CurrentPR)
+	} else if currentPRHeadRef == "" {
+		printMessage(out, "  There is no current branch")
 	} else {
 		message := fmt.Sprintf("  There is no pull request associated with %s", utils.Cyan("["+currentPRHeadRef+"]"))
 		printMessage(out, message)
@@ -136,8 +139,6 @@ func prList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	fmt.Fprintf(colorableErr(cmd), "\nPull requests for %s\n\n", ghrepo.FullName(baseRepo))
 
 	limit, err := cmd.Flags().GetInt("limit")
 	if err != nil {
@@ -189,28 +190,25 @@ func prList(cmd *cobra.Command, args []string) error {
 		params["assignee"] = assignee
 	}
 
-	prs, err := api.PullRequestList(apiClient, params, limit)
+	listResult, err := api.PullRequestList(apiClient, params, limit)
 	if err != nil {
 		return err
 	}
 
-	if len(prs) == 0 {
-		colorErr := colorableErr(cmd) // Send to stderr because otherwise when piping this command it would seem like the "no open prs" message is actually a pr
-		msg := "There are no open pull requests"
-
-		userSetFlags := false
-		cmd.Flags().Visit(func(f *pflag.Flag) {
-			userSetFlags = true
-		})
-		if userSetFlags {
-			msg = "No pull requests match your search"
+	hasFilters := false
+	cmd.Flags().Visit(func(f *pflag.Flag) {
+		switch f.Name {
+		case "state", "label", "base", "assignee":
+			hasFilters = true
 		}
-		printMessage(colorErr, msg)
-		return nil
-	}
+	})
+
+	title := listHeader(ghrepo.FullName(baseRepo), "pull request", len(listResult.PullRequests), listResult.TotalCount, hasFilters)
+	// TODO: avoid printing header if piped to a script
+	fmt.Fprintf(colorableErr(cmd), "\n%s\n\n", title)
 
 	table := utils.NewTablePrinter(cmd.OutOrStdout())
-	for _, pr := range prs {
+	for _, pr := range listResult.PullRequests {
 		prNum := strconv.Itoa(pr.Number)
 		if table.IsTTY() {
 			prNum = "#" + prNum
@@ -391,45 +389,51 @@ func printPrs(w io.Writer, totalCount int, prs ...api.PullRequest) {
 	for _, pr := range prs {
 		prNumber := fmt.Sprintf("#%d", pr.Number)
 
-		prNumberColorFunc := utils.Green
+		prStateColorFunc := utils.Green
 		if pr.IsDraft {
-			prNumberColorFunc = utils.Gray
+			prStateColorFunc = utils.Gray
 		} else if pr.State == "MERGED" {
-			prNumberColorFunc = utils.Magenta
+			prStateColorFunc = utils.Magenta
 		} else if pr.State == "CLOSED" {
-			prNumberColorFunc = utils.Red
+			prStateColorFunc = utils.Red
 		}
 
-		fmt.Fprintf(w, "  %s  %s %s", prNumberColorFunc(prNumber), text.Truncate(50, replaceExcessiveWhitespace(pr.Title)), utils.Cyan("["+pr.HeadLabel()+"]"))
+		fmt.Fprintf(w, "  %s  %s %s", prStateColorFunc(prNumber), text.Truncate(50, replaceExcessiveWhitespace(pr.Title)), utils.Cyan("["+pr.HeadLabel()+"]"))
 
 		checks := pr.ChecksStatus()
 		reviews := pr.ReviewStatus()
-		if checks.Total > 0 || reviews.ChangesRequested || reviews.Approved {
-			fmt.Fprintf(w, "\n  ")
-		}
 
-		if checks.Total > 0 {
-			var summary string
-			if checks.Failing > 0 {
-				if checks.Failing == checks.Total {
-					summary = utils.Red("All checks failing")
-				} else {
-					summary = utils.Red(fmt.Sprintf("%d/%d checks failing", checks.Failing, checks.Total))
-				}
-			} else if checks.Pending > 0 {
-				summary = utils.Yellow("Checks pending")
-			} else if checks.Passing == checks.Total {
-				summary = utils.Green("Checks passing")
+		if pr.State == "OPEN" {
+			if checks.Total > 0 || reviews.ChangesRequested || reviews.Approved {
+				fmt.Fprintf(w, "\n  ")
 			}
-			fmt.Fprintf(w, " - %s", summary)
-		}
 
-		if reviews.ChangesRequested {
-			fmt.Fprintf(w, " - %s", utils.Red("Changes requested"))
-		} else if reviews.ReviewRequired {
-			fmt.Fprintf(w, " - %s", utils.Yellow("Review required"))
-		} else if reviews.Approved {
-			fmt.Fprintf(w, " - %s", utils.Green("Approved"))
+			if checks.Total > 0 {
+				var summary string
+				if checks.Failing > 0 {
+					if checks.Failing == checks.Total {
+						summary = utils.Red("All checks failing")
+					} else {
+						summary = utils.Red(fmt.Sprintf("%d/%d checks failing", checks.Failing, checks.Total))
+					}
+				} else if checks.Pending > 0 {
+					summary = utils.Yellow("Checks pending")
+				} else if checks.Passing == checks.Total {
+					summary = utils.Green("Checks passing")
+				}
+				fmt.Fprintf(w, " - %s", summary)
+			}
+
+			if reviews.ChangesRequested {
+				fmt.Fprintf(w, " - %s", utils.Red("Changes requested"))
+			} else if reviews.ReviewRequired {
+				fmt.Fprintf(w, " - %s", utils.Yellow("Review required"))
+			} else if reviews.Approved {
+				fmt.Fprintf(w, " - %s", utils.Green("Approved"))
+			}
+		} else {
+			s := strings.Title(strings.ToLower(pr.State))
+			fmt.Fprintf(w, " - %s", prStateColorFunc(s))
 		}
 
 		fmt.Fprint(w, "\n")

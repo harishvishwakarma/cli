@@ -10,7 +10,7 @@ import (
 type PullRequestsPayload struct {
 	ViewerCreated   PullRequestAndTotalCount
 	ReviewRequested PullRequestAndTotalCount
-	CurrentPRs      []PullRequest
+	CurrentPR       *PullRequest
 }
 
 type PullRequestAndTotalCount struct {
@@ -262,13 +262,12 @@ func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, cu
 		reviewRequested = append(reviewRequested, edge.Node)
 	}
 
-	var currentPRs []PullRequest
-	if resp.Repository.PullRequest != nil {
-		currentPRs = append(currentPRs, *resp.Repository.PullRequest)
-	} else {
+	var currentPR = resp.Repository.PullRequest
+	if currentPR == nil {
 		for _, edge := range resp.Repository.PullRequests.Edges {
 			if edge.Node.HeadLabel() == currentPRHeadRef {
-				currentPRs = append(currentPRs, edge.Node)
+				currentPR = &edge.Node
+				break // Take the most recent PR for the current branch
 			}
 		}
 	}
@@ -282,7 +281,7 @@ func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, cu
 			PullRequests: reviewRequested,
 			TotalCount:   resp.ReviewRequested.TotalCount,
 		},
-		CurrentPRs: currentPRs,
+		CurrentPR: currentPR,
 	}
 
 	return &payload, nil
@@ -438,7 +437,7 @@ func CreatePullRequest(client *Client, repo *Repository, params map[string]inter
 	return &result.CreatePullRequest.PullRequest, nil
 }
 
-func PullRequestList(client *Client, vars map[string]interface{}, limit int) ([]PullRequest, error) {
+func PullRequestList(client *Client, vars map[string]interface{}, limit int) (*PullRequestAndTotalCount, error) {
 	type prBlock struct {
 		Edges []struct {
 			Node PullRequest
@@ -447,6 +446,8 @@ func PullRequestList(client *Client, vars map[string]interface{}, limit int) ([]
 			HasNextPage bool
 			EndCursor   string
 		}
+		TotalCount int
+		IssueCount int
 	}
 	type response struct {
 		Repository struct {
@@ -490,24 +491,26 @@ func PullRequestList(client *Client, vars map[string]interface{}, limit int) ([]
 			first: $limit,
 			after: $endCursor,
 			orderBy: {field: CREATED_AT, direction: DESC}
-		) {
-          edges {
-            node {
-				...pr
-            }
-		  }
-		  pageInfo {
-			  hasNextPage
-			  endCursor
-		  }
-        }
-      }
+			) {
+				totalCount
+				edges {
+					node {
+						...pr
+					}
+				}
+				pageInfo {
+					hasNextPage
+					endCursor
+				}
+			}
+		}
 	}`
 
 	var check = make(map[int]struct{})
 	var prs []PullRequest
 	pageLimit := min(limit, 100)
 	variables := map[string]interface{}{}
+	res := PullRequestAndTotalCount{}
 
 	// If assignee was specified, use the `search` API rather than
 	// `Repository.pullRequests`, but this mode doesn't support multiple labels
@@ -519,6 +522,7 @@ func PullRequestList(client *Client, vars map[string]interface{}, limit int) ([]
 			$endCursor: String,
 		) {
 			search(query: $q, type: ISSUE, first: $limit, after: $endCursor) {
+				issueCount
 				edges {
 					node {
 						...pr
@@ -572,8 +576,10 @@ loop:
 			return nil, err
 		}
 		prData := data.Repository.PullRequests
+		res.TotalCount = prData.TotalCount
 		if _, ok := variables["q"]; ok {
 			prData = data.Search
+			res.TotalCount = prData.IssueCount
 		}
 
 		for _, edge := range prData.Edges {
@@ -595,8 +601,8 @@ loop:
 			break
 		}
 	}
-
-	return prs, nil
+	res.PullRequests = prs
+	return &res, nil
 }
 
 func min(a, b int) int {

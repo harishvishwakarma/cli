@@ -134,9 +134,7 @@ var apiClientForContext = func(ctx context.Context) (*api.Client, error) {
 		api.AddHeader("Authorization", fmt.Sprintf("token %s", token)),
 		api.AddHeader("User-Agent", fmt.Sprintf("GitHub CLI %s", Version)),
 		// antiope-preview: Checks
-		// shadow-cat-preview: Draft pull requests
-		api.AddHeader("Accept", "application/vnd.github.antiope-preview+json, application/vnd.github.shadow-cat-preview"),
-		api.AddHeader("GraphQL-Features", "pe_mobile"),
+		api.AddHeader("Accept", "application/vnd.github.antiope-preview+json"),
 	)
 
 	return api.NewClient(opts...), nil
@@ -176,6 +174,11 @@ func changelogURL(version string) string {
 }
 
 func determineBaseRepo(cmd *cobra.Command, ctx context.Context) (ghrepo.Interface, error) {
+	repo, err := cmd.Flags().GetString("repo")
+	if err == nil && repo != "" {
+		return ghrepo.FromFullName(repo), nil
+	}
+
 	apiClient, err := apiClientForContext(ctx)
 	if err != nil {
 		return nil, err
